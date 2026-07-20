@@ -1,0 +1,7 @@
+interface:
+  display_name: "Herdr Jobs"
+  short_description: "Launch and manage background Codex jobs"
+  default_prompt: "Use $herdr-jobs to start a background Codex task in the current Herdr workspace."
+
+policy:
+  allow_implicit_invocation: false
