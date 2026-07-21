@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 AGENT_RE = re.compile(r"^hj-([0-9a-f]{4})-([a-z0-9][a-z0-9-]*)$")
 TAB_RE = re.compile(r"^([0-9a-f]{4}) · (.+)$")
+WORKSPACE_RE = re.compile(r"^hj-([0-9a-f]{4}) · (.+)$")
+BOOTSTRAP_TAB_RE = re.compile(r"^hj-bootstrap-([0-9a-f]{4})$")
 ACTIVE_STATES = {"working", "blocked", "unknown"}
 READY_STATES = {"done", "idle"}
 
@@ -50,6 +52,7 @@ class Workspace:
     workspace_id: str
     label: str | None = None
     cwd: str | None = None
+    owner_group: str | None = None
 
 
 @dataclass
@@ -137,10 +140,13 @@ def workspace_from_mapping(mapping: dict[str, Any]) -> Workspace | None:
             workspace_id = possible_id
     if not workspace_id:
         return None
+    label = first_text(mapping, "label", "name", "title")
+    owner_match = WORKSPACE_RE.fullmatch(label) if label else None
     return Workspace(
         workspace_id=workspace_id,
-        label=first_text(mapping, "label", "name", "title"),
+        label=label,
         cwd=first_text(mapping, "cwd", "working_directory", "path"),
+        owner_group=owner_match.group(1) if owner_match else None,
     )
 
 
@@ -149,6 +155,7 @@ def merge_workspace(existing: Workspace, newer: Workspace) -> Workspace:
         workspace_id=existing.workspace_id,
         label=newer.label or existing.label,
         cwd=newer.cwd or existing.cwd,
+        owner_group=newer.owner_group or existing.owner_group,
     )
 
 
@@ -454,13 +461,82 @@ def select_group(jobs: list[Job], requested: str | None) -> tuple[str, list[Job]
     return groups[0], jobs
 
 
-def choose_group_token(existing_jobs: list[Job]) -> str:
+def choose_group_token(
+    existing_jobs: list[Job], existing_workspaces: list[Workspace]
+) -> str:
     existing = {job.group for job in existing_jobs}
+    existing.update(
+        workspace.owner_group
+        for workspace in existing_workspaces
+        if workspace.owner_group
+    )
     for _ in range(256):
         token = secrets.token_hex(2)
         if token not in existing:
             return token
     raise JobError("group_token_exhausted", "Could not allocate a unique group token.")
+
+
+def normalize_new_workspace_cwd(raw_cwd: str | None) -> str:
+    cwd = os.path.abspath(os.path.expanduser(raw_cwd or os.getcwd()))
+    if not os.path.isdir(cwd):
+        raise JobError(
+            "workspace_cwd_not_found",
+            f"New workspace directory does not exist: {cwd}",
+        )
+    return cwd
+
+
+def normalize_workspace_label(raw_label: str | None, tasks: list[tuple[str, str]]) -> str:
+    if raw_label is None:
+        return tasks[0][0] if len(tasks) == 1 else f"{len(tasks)}-jobs"
+    label = " ".join(raw_label.split())
+    if not label:
+        raise JobError("invalid_workspace_label", "Workspace label cannot be empty.")
+    return label
+
+
+def create_owned_workspace(
+    group: str, cwd: str, display_label: str
+) -> tuple[Workspace, dict[str, str | None], list[dict[str, str]]]:
+    full_label = f"hj-{group} · {display_label}"
+    response = run_herdr(
+        [
+            "workspace",
+            "create",
+            "--cwd",
+            cwd,
+            "--label",
+            full_label,
+            "--no-focus",
+        ]
+    )
+    ids = extract_ids(response)
+    if not ids["workspace_id"]:
+        raise JobError(
+            "workspace_id_missing",
+            "Herdr did not report the newly created workspace ID.",
+        )
+    workspace = Workspace(
+        workspace_id=ids["workspace_id"],
+        label=full_label,
+        cwd=cwd,
+        owner_group=group,
+    )
+    warnings: list[dict[str, str]] = []
+    if ids["tab_id"]:
+        try:
+            run_herdr(
+                ["tab", "rename", ids["tab_id"], f"hj-bootstrap-{group}"]
+            )
+        except HerdrCommandError as error:
+            warnings.append(
+                {
+                    "operation": "bootstrap_tab_rename",
+                    "error": str(error),
+                }
+            )
+    return workspace, ids, warnings
 
 
 def extract_ids(response: Any) -> dict[str, str | None]:
@@ -502,12 +578,37 @@ def wait_for_working(name: str, timeout_ms: int) -> dict[str, Any]:
 
 
 def start_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    workspace = resolve_workspace(args.workspace)
     tasks = normalize_tasks(args.task)
-    group = choose_group_token(discover_jobs(include_tab_fallback=False))
+    if not args.new_workspace and (args.workspace_label or args.cwd):
+        raise JobError(
+            "new_workspace_option_required",
+            "--workspace-label and --cwd require --new-workspace.",
+        )
+
+    existing_workspaces = list_workspaces()
+    group = choose_group_token(
+        discover_jobs(include_tab_fallback=False), existing_workspaces
+    )
+    workspace_created = bool(args.new_workspace)
+    bootstrap_ids: dict[str, str | None] = {
+        "workspace_id": None,
+        "tab_id": None,
+        "pane_id": None,
+        "terminal_id": None,
+    }
+    warnings: list[dict[str, str]] = []
+    if workspace_created:
+        cwd = normalize_new_workspace_cwd(args.cwd)
+        display_label = normalize_workspace_label(args.workspace_label, tasks)
+        workspace, bootstrap_ids, create_warnings = create_owned_workspace(
+            group, cwd, display_label
+        )
+        warnings.extend(create_warnings)
+    else:
+        workspace = resolve_workspace(args.workspace)
+
     launched: list[Job] = []
     failures: list[dict[str, str]] = []
-    warnings: list[dict[str, str]] = []
 
     for label, prompt in tasks:
         name = f"hj-{group}-{label}"
@@ -555,6 +656,58 @@ def start_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         except (HerdrCommandError, JobError) as error:
             failures.append({"label": label, "error": str(error)})
 
+    if workspace_created:
+        launched_tab_ids = {job.tab_id for job in launched if job.tab_id}
+        launched_pane_ids = {job.pane_id for job in launched if job.pane_id}
+        if launched and bootstrap_ids["tab_id"] in launched_tab_ids:
+            if (
+                bootstrap_ids["pane_id"]
+                and bootstrap_ids["pane_id"] not in launched_pane_ids
+            ):
+                try:
+                    run_herdr(["pane", "close", bootstrap_ids["pane_id"]])
+                except HerdrCommandError as error:
+                    warnings.append(
+                        {
+                            "operation": "bootstrap_pane_close",
+                            "error": str(error),
+                        }
+                    )
+            else:
+                warnings.append(
+                    {
+                        "operation": "bootstrap_pane_close",
+                        "error": "Herdr did not report a distinct bootstrap pane ID.",
+                    }
+                )
+        elif launched and bootstrap_ids["tab_id"]:
+            try:
+                run_herdr(["tab", "close", bootstrap_ids["tab_id"]])
+            except HerdrCommandError as error:
+                warnings.append(
+                    {
+                        "operation": "bootstrap_tab_close",
+                        "error": str(error),
+                    }
+                )
+        elif launched:
+            warnings.append(
+                {
+                    "operation": "bootstrap_tab_close",
+                    "error": "Herdr did not report the bootstrap tab ID.",
+                }
+            )
+        elif not launched:
+            try:
+                run_herdr(["workspace", "close", workspace.workspace_id])
+            except HerdrCommandError as error:
+                warnings.append(
+                    {
+                        "operation": "failed_launch_workspace_rollback",
+                        "error": str(error),
+                    }
+                )
+
     confirmations: list[dict[str, Any]] = []
     if args.confirm and launched:
         with concurrent.futures.ThreadPoolExecutor(
@@ -571,7 +724,10 @@ def start_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "ok": not failures,
         "operation": "start",
         "group": group,
-        "workspace": asdict(workspace),
+        "workspace": {
+            **asdict(workspace),
+            "created_by_skill": workspace_created,
+        },
         "launched": [asdict(job) for job in launched],
         "failed": failures,
         "warnings": warnings,
@@ -681,28 +837,204 @@ def collect_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     }, 0
 
 
+def list_workspace_tabs(workspace_id: str) -> dict[str, dict[str, Any]]:
+    response = run_herdr(["tab", "list", "--workspace", workspace_id])
+    tabs: dict[str, dict[str, Any]] = {}
+    for mapping in walk_dicts(response):
+        tab_id = first_text(mapping, "tab_id")
+        if not tab_id:
+            possible_id = first_text(mapping, "id")
+            if possible_id and re.fullmatch(
+                r"w[0-9A-Za-z]+:t[0-9A-Za-z]+", possible_id
+            ):
+                tab_id = possible_id
+        if not tab_id:
+            continue
+        tabs[tab_id] = {
+            "tab_id": tab_id,
+            "label": first_text(mapping, "label", "name", "title"),
+        }
+    return tabs
+
+
+def list_workspace_panes(workspace_id: str) -> dict[str, list[str]]:
+    response = run_herdr(["pane", "list", "--workspace", workspace_id])
+    panes_by_tab: dict[str, list[str]] = {}
+    seen: set[tuple[str, str]] = set()
+    for mapping in walk_dicts(response):
+        tab_id = first_text(mapping, "tab_id")
+        pane_id = first_text(mapping, "pane_id")
+        if not tab_id or not pane_id or (tab_id, pane_id) in seen:
+            continue
+        seen.add((tab_id, pane_id))
+        panes_by_tab.setdefault(tab_id, []).append(pane_id)
+    return panes_by_tab
+
+
+def inspect_workspace_ownership(
+    workspace: Workspace, jobs: list[Job], group: str
+) -> dict[str, Any]:
+    tabs = list_workspace_tabs(workspace.workspace_id)
+    panes_by_tab = list_workspace_panes(workspace.workspace_id)
+    jobs_by_tab = {
+        job.tab_id: job
+        for job in jobs
+        if job.workspace_id == workspace.workspace_id and job.tab_id
+    }
+    safe_job_tabs: set[str] = set()
+    contaminated_job_tabs: dict[str, str] = {}
+    owned_bootstrap_tabs: set[str] = set()
+    unrelated_tabs: list[dict[str, Any]] = []
+
+    for tab_id, tab in tabs.items():
+        pane_ids = panes_by_tab.get(tab_id, [])
+        job = jobs_by_tab.get(tab_id)
+        if job:
+            if job.pane_id and pane_ids == [job.pane_id]:
+                safe_job_tabs.add(tab_id)
+            else:
+                contaminated_job_tabs[tab_id] = "job_tab_has_unowned_or_missing_panes"
+            continue
+
+        bootstrap_match = (
+            BOOTSTRAP_TAB_RE.fullmatch(tab["label"]) if tab["label"] else None
+        )
+        if bootstrap_match and bootstrap_match.group(1) == group and len(pane_ids) == 1:
+            owned_bootstrap_tabs.add(tab_id)
+            continue
+        unrelated_tabs.append(
+            {"tab_id": tab_id, "label": tab["label"], "pane_ids": pane_ids}
+        )
+
+    known_tab_ids = set(tabs)
+    missing_job_tabs = sorted(
+        tab_id for tab_id in jobs_by_tab if tab_id not in known_tab_ids
+    )
+    exclusive = bool(tabs) and workspace.owner_group == group and not (
+        contaminated_job_tabs or unrelated_tabs or missing_job_tabs
+    )
+    reasons: list[str] = []
+    if workspace.owner_group != group:
+        reasons.append("not_skill_owned")
+    if not tabs:
+        reasons.append("workspace_has_no_reported_tabs")
+    if contaminated_job_tabs:
+        reasons.append("job_tab_contains_unowned_or_missing_panes")
+    if unrelated_tabs:
+        reasons.append("workspace_contains_unrelated_tabs")
+    if missing_job_tabs:
+        reasons.append("job_tab_missing_from_workspace_inventory")
+
+    return {
+        "exclusive": exclusive,
+        "safe_job_tabs": safe_job_tabs,
+        "contaminated_job_tabs": contaminated_job_tabs,
+        "owned_bootstrap_tabs": owned_bootstrap_tabs,
+        "unrelated_tabs": unrelated_tabs,
+        "missing_job_tabs": missing_job_tabs,
+        "reasons": reasons,
+    }
+
+
 def cleanup_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     group, jobs = selected_live_jobs(args.group)
     closed: list[dict[str, Any]] = []
     preserved: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    closed_workspaces: list[dict[str, Any]] = []
+    preserved_workspaces: list[dict[str, Any]] = []
     closed_tabs: set[str] = set()
+    handled_jobs: set[str] = set()
+
+    workspaces = {workspace.workspace_id: workspace for workspace in list_workspaces()}
+    workspace_ids = sorted(
+        {
+            job.workspace_id
+            for job in jobs
+            if job.workspace_id
+        }
+        | {
+            workspace.workspace_id
+            for workspace in workspaces.values()
+            if workspace.owner_group == group
+        }
+    )
+
+    for workspace_id in workspace_ids:
+        workspace = workspaces.get(workspace_id)
+        workspace_jobs = [job for job in jobs if job.workspace_id == workspace_id]
+        if not workspace:
+            for job in workspace_jobs:
+                failed.append({**asdict(job), "error": "workspace_not_found"})
+                handled_jobs.add(job.name)
+            continue
+
+        try:
+            inspection = inspect_workspace_ownership(workspace, workspace_jobs, group)
+        except HerdrCommandError as error:
+            preserved_workspaces.append(
+                {**asdict(workspace), "reasons": ["workspace_inspection_failed"]}
+            )
+            for job in workspace_jobs:
+                failed.append({**asdict(job), "error": str(error)})
+                handled_jobs.add(job.name)
+            continue
+
+        active_jobs = [job for job in workspace_jobs if job.state in ACTIVE_STATES]
+        if inspection["exclusive"] and (args.force or not active_jobs):
+            try:
+                run_herdr(["workspace", "close", workspace_id])
+                closed_workspaces.append(asdict(workspace))
+                for job in workspace_jobs:
+                    closed.append(asdict(job))
+                    handled_jobs.add(job.name)
+                continue
+            except HerdrCommandError as error:
+                preserved_workspaces.append(
+                    {**asdict(workspace), "reasons": ["workspace_close_failed"]}
+                )
+                for job in workspace_jobs:
+                    failed.append({**asdict(job), "error": str(error)})
+                    handled_jobs.add(job.name)
+                continue
+
+        workspace_reasons = list(inspection["reasons"])
+        if active_jobs and not args.force:
+            workspace_reasons.append("workspace_contains_active_jobs")
+        preserved_workspaces.append(
+            {**asdict(workspace), "reasons": sorted(set(workspace_reasons))}
+        )
+
+        safe_job_tabs = inspection["safe_job_tabs"]
+        for job in workspace_jobs:
+            handled_jobs.add(job.name)
+            if not args.force and job.state in ACTIVE_STATES:
+                preserved.append({**asdict(job), "reason": "active_job"})
+                continue
+            if not job.tab_id:
+                failed.append({**asdict(job), "error": "tab_id_missing"})
+                continue
+            if job.tab_id not in safe_job_tabs:
+                preserved.append(
+                    {**asdict(job), "reason": "job_tab_not_exclusively_owned"}
+                )
+                continue
+            if job.tab_id in closed_tabs:
+                continue
+            try:
+                run_herdr(["tab", "close", job.tab_id])
+                closed_tabs.add(job.tab_id)
+                closed.append(asdict(job))
+            except HerdrCommandError as error:
+                failed.append({**asdict(job), "error": str(error)})
 
     for job in jobs:
-        if not args.force and job.state in ACTIVE_STATES:
-            preserved.append(asdict(job))
+        if job.name in handled_jobs:
             continue
-        if not job.tab_id:
-            failed.append({**asdict(job), "error": "tab_id_missing"})
-            continue
-        if job.tab_id in closed_tabs:
-            continue
-        try:
-            run_herdr(["tab", "close", job.tab_id])
-            closed_tabs.add(job.tab_id)
-            closed.append(asdict(job))
-        except HerdrCommandError as error:
-            failed.append({**asdict(job), "error": str(error)})
+        if not job.workspace_id:
+            failed.append({**asdict(job), "error": "workspace_id_missing"})
+        else:
+            failed.append({**asdict(job), "error": "workspace_not_inspected"})
 
     return {
         "ok": not failed,
@@ -711,6 +1043,8 @@ def cleanup_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "force": bool(args.force),
         "closed": closed,
         "preserved": preserved,
+        "closed_workspaces": closed_workspaces,
+        "preserved_workspaces": preserved_workspaces,
         "failed": failed,
     }, 0 if not failed else 2
 
@@ -722,7 +1056,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="operation", required=True)
 
     start = subparsers.add_parser("start")
-    start.add_argument("--workspace")
+    workspace_target = start.add_mutually_exclusive_group()
+    workspace_target.add_argument("--workspace")
+    workspace_target.add_argument("--new-workspace", action="store_true")
+    start.add_argument("--workspace-label")
+    start.add_argument("--cwd")
     start.add_argument(
         "--task",
         action="append",
